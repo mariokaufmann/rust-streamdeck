@@ -1,20 +1,25 @@
-use std::{io::Error as IoError};
+use std::cmp::max;
+use std::io::Error as IoError;
 use std::time::Duration;
 
 #[macro_use]
 extern crate log;
 
 extern crate hidapi;
+
 use hidapi::{HidApi, HidDevice, HidError};
 
 extern crate image;
+
 use image::{DynamicImage, ImageBuffer, ImageError, Rgb};
 
 pub mod images;
+
 use crate::images::{apply_transform, encode_jpeg};
 pub use crate::images::{Colour, ImageOptions};
 
 pub mod info;
+
 pub use info::*;
 
 use imageproc::drawing::draw_text_mut;
@@ -32,11 +37,11 @@ pub struct StreamDeck {
 #[cfg(feature = "structopt")]
 #[derive(structopt::StructOpt)]
 pub struct Filter {
-    #[structopt(long, default_value="0fd9", parse(try_from_str=u16_parse_hex), env="USB_VID")]
+    #[structopt(long, default_value = "0fd9", parse(try_from_str = u16_parse_hex), env = "USB_VID")]
     /// USB Device Vendor ID (VID) in hex
     pub vid: u16,
 
-    #[structopt(long, default_value="0063", parse(try_from_str=u16_parse_hex), env="USB_PID")]
+    #[structopt(long, default_value = "0063", parse(try_from_str = u16_parse_hex), env = "USB_PID")]
     /// USB Device Product ID (PID) in hex
     pub pid: u16,
 
@@ -64,8 +69,27 @@ pub enum Error {
     InvalidKeyIndex,
     #[error("unrecognised pid")]
     UnrecognisedPID,
+    #[error("unrecognised command")]
+    UnrecognisedCommand,
     #[error("no data")]
     NoData,
+}
+
+pub enum DeviceInput {
+    ButtonsPressed(Vec<u8>),
+    DialsTurned(Vec<i8>),
+    DialsPushed(Vec<u8>),
+    DisplayTouched {
+        x_position: u16,
+        y_position: u16,
+        long_touch: bool,
+    },
+    DisplayTouchDragged {
+        x_from: u16,
+        y_from: u16,
+        x_to: u16,
+        y_to: u16,
+    },
 }
 
 pub struct DeviceImage {
@@ -81,9 +105,7 @@ impl DeviceImage {
 
 impl From<Vec<u8>> for DeviceImage {
     fn from(data: Vec<u8>) -> Self {
-        Self {
-            data
-        }
+        Self { data }
     }
 }
 
@@ -95,6 +117,7 @@ pub mod pids {
     pub const XL: u16 = 0x006c;
     pub const MK2: u16 = 0x0080;
     pub const REVISED_MINI: u16 = 0x0090;
+    pub const PLUS: u16 = 0x0084;
 }
 
 impl StreamDeck {
@@ -121,6 +144,7 @@ impl StreamDeck {
             pids::XL => Kind::Xl,
             pids::MK2 => Kind::Mk2,
             pids::REVISED_MINI => Kind::Mini,
+            pids::PLUS => Kind::Plus,
 
             _ => return Err(Error::UnrecognisedPID),
         };
@@ -215,42 +239,112 @@ impl StreamDeck {
         Ok(())
     }
 
-    /// Fetch button states
-    ///
-    /// In blocking mode this will wait until a report packet has been received
-    /// (or the specified timeout has elapsed). In non-blocking mode this will return
-    /// immediately with a zero vector if no data is available
-    pub fn read_buttons(&mut self, timeout: Option<Duration>) -> Result<Vec<u8>, Error> {
+    pub fn read_inputs(&mut self, timeout: Option<Duration>) -> Result<DeviceInput, Error> {
         let mut cmd = [0u8; 36];
         let keys = self.kind.keys() as usize;
+        let dials = self.kind.dials() as usize;
         let offset = self.kind.key_data_offset();
+
+        const TOUCHSCREEN_REPORT_LENGTH: usize = 13;
+        let data_length = max(keys, 13);
+        let read_length = offset + data_length + 1;
 
         match timeout {
             Some(t) => self
                 .device
-                .read_timeout(&mut cmd[..keys + offset + 1], t.as_millis() as i32)?,
-            None => self.device.read(&mut cmd[..keys + offset + 1])?,
+                .read_timeout(&mut cmd[..read_length], t.as_millis() as i32)?,
+            None => self.device.read(&mut cmd[..read_length])?,
         };
 
         if cmd[0] == 0 {
             return Err(Error::NoData);
         }
 
-        let mut out = vec![0u8; keys];
-        match self.kind.key_direction() {
-            KeyDirection::RightToLeft => {
-                for (i, val) in out.iter_mut().enumerate() {
-                    // In right-to-left mode(original Streamdeck) the first key has index 1,
-                    // so we don't add the +1 here.
-                    *val = cmd[offset + self.translate_key_index(i as u8)? as usize];
+        const BUTTONS_DATA_TYPE: u8 = 0x00;
+        const TOUCHSCREEN_DATA_TYPE: u8 = 0x02;
+        const DIALS_DATA_TYPE: u8 = 0x03;
+
+        let data_type = cmd[1];
+        match data_type {
+            BUTTONS_DATA_TYPE => {
+                let mut out = vec![0u8; keys];
+                match self.kind.key_direction() {
+                    KeyDirection::RightToLeft => {
+                        for (i, val) in out.iter_mut().enumerate() {
+                            // In right-to-left mode(original Streamdeck) the first key has index 1,
+                            // so we don't add the +1 here.
+                            *val = cmd[offset + self.translate_key_index(i as u8)? as usize];
+                        }
+                    }
+                    KeyDirection::LeftToRight => {
+                        out[0..keys].copy_from_slice(&cmd[1 + offset..1 + offset + keys]);
+                    }
+                }
+                Ok(DeviceInput::ButtonsPressed(out))
+            }
+            TOUCHSCREEN_DATA_TYPE => {
+                const TOUCHSCREEN_TOUCH_SHORT: u8 = 0x01;
+                const TOUCHSCREEN_TOUCH_LONG: u8 = 0x02;
+                const TOUCHSCREEN_TOUCH_DRAG: u8 = 0x03;
+
+                let x_from = u16::from_le_bytes([cmd[6], cmd[7]]);
+                let y_from = u16::from_le_bytes([cmd[8], cmd[9]]);
+
+                let touchscreen_event_type = cmd[4];
+                match touchscreen_event_type {
+                    TOUCHSCREEN_TOUCH_SHORT => Ok(DeviceInput::DisplayTouched {
+                        x_position: x_from,
+                        y_position: y_from,
+                        long_touch: false,
+                    }),
+                    TOUCHSCREEN_TOUCH_LONG => Ok(DeviceInput::DisplayTouched {
+                        x_position: x_from,
+                        y_position: y_from,
+                        long_touch: true,
+                    }),
+                    TOUCHSCREEN_TOUCH_DRAG => {
+                        let x_to = u16::from_le_bytes([cmd[10], cmd[11]]);
+                        let y_to = u16::from_le_bytes([cmd[12], cmd[13]]);
+
+                        Ok(DeviceInput::DisplayTouchDragged {
+                            x_from,
+                            y_from,
+                            x_to,
+                            y_to,
+                        })
+                    }
+                    _ => Err(Error::UnrecognisedCommand),
                 }
             }
-            KeyDirection::LeftToRight => {
-                out[0..keys].copy_from_slice(&cmd[1 + offset..1 + offset + keys]);
+            DIALS_DATA_TYPE => {
+                const DIAL_PUSH: u8 = 0x00;
+                const DIAL_TURN: u8 = 0x01;
+                let dials_event_type = cmd[4];
+                match dials_event_type {
+                    DIAL_PUSH => Ok(DeviceInput::DialsPushed(cmd[5..5 + dials].to_vec())),
+                    DIAL_TURN => {
+                        let dial_turn_values =
+                            cmd[5..5 + dials].iter().map(|val| *val as i8).collect();
+                        Ok(DeviceInput::DialsTurned(dial_turn_values))
+                    }
+                    _ => Err(Error::UnrecognisedCommand),
+                }
             }
+            _ => Err(Error::UnrecognisedCommand),
         }
+    }
 
-        Ok(out)
+    /// Fetch button states
+    ///
+    /// In blocking mode this will wait until a report packet has been received
+    /// (or the specified timeout has elapsed). In non-blocking mode this will return
+    /// immediately with a zero vector if no data is available
+    pub fn read_buttons(&mut self, timeout: Option<Duration>) -> Result<Vec<u8>, Error> {
+        let inputs = self.read_inputs(timeout)?;
+        match inputs {
+            DeviceInput::ButtonsPressed(buttons) => Ok(buttons),
+            _ => Ok(vec![]),
+        }
     }
 
     /// Fetch image size for the connected device
@@ -260,7 +354,7 @@ impl StreamDeck {
 
     /// Convert an image into the device dependent format
     fn convert_image(&self, image: Vec<u8>) -> Result<DeviceImage, Error> {
-            // Check image dimensions
+        // Check image dimensions
         if image.len() != self.kind.image_size_bytes() {
             return Err(Error::InvalidImageSize);
         }
@@ -271,7 +365,7 @@ impl StreamDeck {
                 encode_jpeg(&image, w, h)?
             }
         };
-        Ok(DeviceImage{ data: image })
+        Ok(DeviceImage { data: image })
     }
 
     /// Set a button to the provided RGB colour
@@ -347,16 +441,30 @@ impl StreamDeck {
         image: &str,
         opts: &ImageOptions,
     ) -> Result<(), Error> {
-
         self.write_button_image(key, &self.load_image(image, opts)?)
     }
 
-    /// Load an image file into the device specific representation
-    pub fn load_image(
-        &self,
+    pub fn set_touch_display_file(
+        &mut self,
         image: &str,
         opts: &ImageOptions,
-    ) -> Result<DeviceImage, Error> {
+    ) -> Result<(), Error> {
+        let image = images::load_image(
+            image,
+            200,
+            50,
+            Rotation::Rot0,
+            Mirroring::None,
+            opts,
+            ColourOrder::RGB,
+        )?;
+        let image = encode_jpeg(&image, 200, 50)?;
+
+        self.write_touch_display_image(&DeviceImage { data: image }, 0, 0, 200, 50)
+    }
+
+    /// Load an image file into the device specific representation
+    pub fn load_image(&self, image: &str, opts: &ImageOptions) -> Result<DeviceImage, Error> {
         let (x, y) = self.kind.image_size();
         let rotate = self.kind.image_rotation();
         let mirror = self.kind.image_mirror();
@@ -395,7 +503,6 @@ impl StreamDeck {
     /// Writes an image to a button
     /// Image at this point in correct dimensions and in device native colour order.
     pub fn write_button_image(&mut self, key: u8, image: &DeviceImage) -> Result<(), Error> {
-
         let image = &image.data;
         let key = self.translate_key_index(key)?;
 
@@ -458,6 +565,60 @@ impl StreamDeck {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Writes an image to the touch display (if available)
+    /// Image at this point in correct dimensions and in device native colour order.
+    pub fn write_touch_display_image(
+        &mut self,
+        image: &DeviceImage,
+        x_pos: u16,
+        y_pos: u16,
+        width: u16,
+        height: u16,
+    ) -> Result<(), Error> {
+        let image = &image.data;
+
+        let mut buf = vec![0u8; 1024];
+        let hdrlen = 16;
+        {
+            let mut sequence: u16 = 0;
+            let mut offset = 0;
+            let maxdatalen = buf.len() - hdrlen;
+
+            while offset < image.len() {
+                let mut take = (image.len() - offset).min(maxdatalen);
+                let mut start = hdrlen;
+
+                let is_last = take == image.len() - offset;
+
+                buf[0] = 0x02;
+                buf[1] = 0x0c;
+                buf[2..4].copy_from_slice(&(x_pos.to_le_bytes()));
+                buf[4..6].copy_from_slice(&(y_pos.to_le_bytes()));
+                buf[6..8].copy_from_slice(&(width.to_le_bytes()));
+                buf[8..10].copy_from_slice(&(height.to_le_bytes()));
+                buf[10] = if is_last { 1 } else { 0 };
+                buf[11..13].copy_from_slice(&sequence.to_le_bytes());
+                buf[13..15].copy_from_slice(&(take as u16).to_le_bytes());
+                buf[start..start + take].copy_from_slice(&image[offset..offset + take]);
+
+                trace!(
+                    "outputting image chunk [{}..{}[ in [{}..{}[, sequence {}{}",
+                    offset,
+                    offset + take,
+                    start,
+                    start + take,
+                    sequence,
+                    if is_last { " (last)" } else { "" },
+                );
+                self.device.write(&buf)?;
+
+                sequence += 1;
+                offset += take;
+            }
+            Ok(())
         }
     }
 
