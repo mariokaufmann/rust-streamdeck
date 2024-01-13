@@ -22,7 +22,7 @@ pub mod info;
 
 pub use info::*;
 
-use imageproc::drawing::draw_text_mut;
+use imageproc::drawing::{draw_text_mut};
 use rusttype::{Font, Scale};
 use std::str::FromStr;
 use thiserror::Error;
@@ -246,7 +246,7 @@ impl StreamDeck {
         let offset = self.kind.key_data_offset();
 
         const TOUCHSCREEN_REPORT_LENGTH: usize = 13;
-        let data_length = max(keys, 13);
+        let data_length = max(keys, TOUCHSCREEN_REPORT_LENGTH);
         let read_length = offset + data_length + 1;
 
         match timeout {
@@ -444,23 +444,15 @@ impl StreamDeck {
         self.write_button_image(key, &self.load_image(image, opts)?)
     }
 
-    pub fn set_touch_display_file(
+    pub fn set_touch_display_image(
         &mut self,
-        image: &str,
-        opts: &ImageOptions,
+        image: DynamicImage,
     ) -> Result<(), Error> {
-        let image = images::load_image(
-            image,
-            200,
-            50,
-            Rotation::Rot0,
-            Mirroring::None,
-            opts,
-            ColourOrder::RGB,
-        )?;
-        let image = encode_jpeg(&image, 200, 50)?;
+        let width = image.width();
+        let height = image.height();
+        let image = encode_jpeg(image.as_bytes(), width as usize, height as usize)?;
 
-        self.write_touch_display_image(&DeviceImage { data: image }, 0, 0, 200, 50)
+        self.write_touch_display_image(&image, 0, 0, width as u16, height as u16)
     }
 
     /// Load an image file into the device specific representation
@@ -572,13 +564,12 @@ impl StreamDeck {
     /// Image at this point in correct dimensions and in device native colour order.
     pub fn write_touch_display_image(
         &mut self,
-        image: &DeviceImage,
+        image: &[u8],
         x_pos: u16,
         y_pos: u16,
         width: u16,
         height: u16,
     ) -> Result<(), Error> {
-        let image = &image.data;
 
         let mut buf = vec![0u8; 1024];
         let hdrlen = 16;
@@ -588,8 +579,8 @@ impl StreamDeck {
             let maxdatalen = buf.len() - hdrlen;
 
             while offset < image.len() {
-                let mut take = (image.len() - offset).min(maxdatalen);
-                let mut start = hdrlen;
+                let take = (image.len() - offset).min(maxdatalen);
+                let start = hdrlen;
 
                 let is_last = take == image.len() - offset;
 
