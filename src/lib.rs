@@ -239,7 +239,7 @@ impl StreamDeck {
         Ok(())
     }
 
-    pub fn read_inputs(&mut self, timeout: Option<Duration>) -> Result<DeviceInput, Error> {
+    pub fn read_input(&mut self, timeout: Option<Duration>) -> Result<DeviceInput, Error> {
         let mut cmd = [0u8; 36];
         let keys = self.kind.keys() as usize;
         let dials = self.kind.dials() as usize;
@@ -340,7 +340,7 @@ impl StreamDeck {
     /// (or the specified timeout has elapsed). In non-blocking mode this will return
     /// immediately with a zero vector if no data is available
     pub fn read_buttons(&mut self, timeout: Option<Duration>) -> Result<Vec<u8>, Error> {
-        let inputs = self.read_inputs(timeout)?;
+        let inputs = self.read_input(timeout)?;
         match inputs {
             DeviceInput::ButtonsPressed(buttons) => Ok(buttons),
             _ => Ok(vec![]),

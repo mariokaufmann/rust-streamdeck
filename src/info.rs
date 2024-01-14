@@ -84,7 +84,7 @@ impl Kind {
         }
     }
 
-    pub(crate) fn dials(&self) -> u8 {
+    pub fn dials(&self) -> u8 {
         match self {
             Kind::Plus => 4,
             _ => 0,
